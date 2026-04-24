@@ -8,7 +8,7 @@ refresh from free sources, or download the CSV template.
 import io
 import streamlit as st
 import pandas as pd
-from data.loader import load_players, parse_user_upload, REQUIRED_STAT_COLS
+from data.loader import load_players, parse_user_upload
 from engine.scoring import apply_scoring_to_df
 from engine.vorp import calculate_vor
 
