@@ -187,6 +187,7 @@ def merge_espn_onto_sleeper(sleeper_df: pd.DataFrame, espn_df: pd.DataFrame) -> 
         return sleeper_df
 
     updated       = sleeper_df.copy()
+    updated["adp"] = updated["adp"].astype(float)  # ensure float before ESPN merge
     sleeper_names = sleeper_df["name"].tolist()
     stat_count    = 0
     rank_count    = 0
