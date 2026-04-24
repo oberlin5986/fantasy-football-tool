@@ -6,9 +6,10 @@ League configuration. Total rounds auto-calculated from roster slots.
 
 import streamlit as st
 from engine.scoring import SCORING_PRESETS, DEFAULT_SCORING
-from data.loader import load_players
+from data.loader import load_players, fetch_nflverse_weekly
 from engine.scoring import apply_scoring_to_df
 from engine.vorp import calculate_vor
+from engine.variance import apply_variance_to_df, build_weekly_std_map
 
 st.set_page_config(page_title="League Setup", page_icon="⚙️", layout="wide")
 st.title("⚙️ League Setup")
@@ -149,7 +150,7 @@ if st.button("💾 Save Settings & Load Player Data", type="primary", use_contai
         }
     }
 
-    with st.spinner("Loading players and stat projections (this may take ~15 seconds first time)..."):
+    with st.spinner("Loading players, projections and variance profiles..."):
         scoring_type = {"Standard": "standard", "Half-PPR": "half_ppr"}.get(
             scoring_preset, "ppr"
         )
@@ -157,14 +158,26 @@ if st.button("💾 Save Settings & Load Player Data", type="primary", use_contai
         players_df = apply_scoring_to_df(players_df, custom_scoring)
         players_df = calculate_vor(players_df, league_config)
 
+        # Build historical std dev map from nflverse weekly data
+        weekly_df  = fetch_nflverse_weekly(season=2025)
+        if not weekly_df.empty:
+            weekly_std_map = build_weekly_std_map(weekly_df, custom_scoring)
+        else:
+            weekly_std_map = None
+
+        # Apply boom/bust/steady variance profiles
+        players_df = apply_variance_to_df(players_df, custom_scoring,
+                                          weekly_std_map=weekly_std_map)
+
     st.session_state.league_config = league_config
     st.session_state.players_df    = players_df
     st.session_state.draft_started = False
     st.session_state.draft_state   = None
     st.session_state.sim_state     = None
 
-    has_proj = (players_df["projected_points"] > 0).sum()
-    st.success(f"✅ Loaded {len(players_df)} players — {has_proj} with stat projections.")
+    has_proj  = int((players_df["projected_points"] > 0).sum())
+    has_var   = int((players_df["variance_label"] != "Balanced").sum())
+    st.success(f"✅ Loaded {len(players_df)} players — {has_proj} with projections, {has_var} with variance profiles.")
     st.info("Head to **Draft Board** to draft, or **Simulator** to practice.")
 
 if st.session_state.get("league_config"):
