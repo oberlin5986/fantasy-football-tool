@@ -12,7 +12,9 @@ from engine.vorp import calculate_vor
 from engine.variance import apply_variance_to_df, build_weekly_std_map
 from engine.matchups import (
     fetch_schedule, get_team_opponent_map,
-    build_defensive_rankings, rank_defenses, apply_matchups_to_df
+    build_defensive_rankings, rank_defenses,
+    apply_matchups_to_df, build_schedule_env_map,
+    HOT_START_WEEKS, PLAYOFF_WEEKS
 )
 
 st.set_page_config(page_title="League Setup", page_icon="⚙️", layout="wide")
@@ -165,21 +167,33 @@ if st.button("💾 Save Settings & Load Player Data", type="primary", use_contai
         # Historical weekly data (for std dev + defensive rankings)
         weekly_df = fetch_nflverse_weekly(season=2025)
 
-        # Variance profiles
+        # Std dev map for variance
         weekly_std_map = build_weekly_std_map(weekly_df, custom_scoring) if not weekly_df.empty else None
-        players_df = apply_variance_to_df(players_df, custom_scoring, weekly_std_map=weekly_std_map)
 
-        # Matchup data
-        schedule_df = fetch_schedule(season=2026)
+        # Matchup data + schedule-aware environment
+        schedule_df, is_proxy, proxy_note = fetch_schedule(season=2026)
+
         if not schedule_df.empty:
             opponent_map    = get_team_opponent_map(schedule_df)
             def_rankings    = build_defensive_rankings(weekly_df, custom_scoring, season=2025)
             ranked_defenses = rank_defenses(def_rankings)
+            # Schedule-aware env: avg actual home/away environment for each player
+            # across both hot start and playoff weeks combined
+            all_sched_weeks = HOT_START_WEEKS + PLAYOFF_WEEKS
+            schedule_env_map = build_schedule_env_map(players_df, opponent_map, all_sched_weeks)
         else:
-            opponent_map    = {}
-            ranked_defenses = {}
+            opponent_map     = {}
+            ranked_defenses  = {}
+            schedule_env_map = None
 
-        players_df = apply_matchups_to_df(players_df, opponent_map, ranked_defenses)
+        # Apply variance AFTER computing schedule env map
+        players_df = apply_variance_to_df(
+            players_df, custom_scoring,
+            weekly_std_map=weekly_std_map,
+            schedule_env_map=schedule_env_map,
+        )
+        players_df = apply_matchups_to_df(players_df, opponent_map, ranked_defenses,
+                                          schedule_available=not schedule_df.empty)
         schedule_available = not schedule_df.empty
 
     st.session_state.league_config = league_config
@@ -189,11 +203,13 @@ if st.button("💾 Save Settings & Load Player Data", type="primary", use_contai
     st.session_state.sim_state     = None
 
     has_proj = int((players_df["projected_points"] > 0).sum())
-    if schedule_available:
-        st.success(f"✅ Loaded {len(players_df)} players — {has_proj} with projections, variance profiles + matchup data loaded!")
+    st.success(f"✅ Loaded {len(players_df)} players — {has_proj} with projections.")
+    if proxy_note:
+        st.info(proxy_note)
+    elif schedule_available:
+        st.success("📅 2026 schedule loaded — matchup data (Wks 1-3, Wks 15-17) is live!")
     else:
-        st.success(f"✅ Loaded {len(players_df)} players — {has_proj} with projections, variance profiles loaded.")
-        st.info("📅 2026 NFL schedule not yet released (expected ~May). Matchup data will load automatically once available.")
+        st.info("📅 2026 NFL schedule not yet released (expected ~May). Matchup columns will show 'Pending' until then.")
     st.info("Head to **Draft Board** to draft, or **Simulator** to practice.")
 
 if st.session_state.get("league_config"):
