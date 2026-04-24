@@ -10,7 +10,7 @@ Manage projection data:
 import io
 import streamlit as st
 import pandas as pd
-from data.loader import load_players, parse_user_upload, ESPN_SEASON
+from data.loader import load_players, parse_user_upload, ESPN_SEASON, fetch_espn_projections, fetch_sleeper_adp
 from engine.scoring import apply_scoring_to_df
 from engine.vorp import calculate_vor
 
