@@ -1,85 +1,86 @@
 """
 engine/variance.py
 ------------------
-Calculates boom/bust/steady profiles for each player based on:
-  1. TD dependency ratio      — how much of projected value comes from TDs
-  2. Volume floor score       — how much comes from reliable yards/receptions
-  3. Stadium environment      — dome vs outdoor vs cold-weather outdoor
-  4. Historical std deviation — actual week-to-week variance from last season
-     (populated when nflverse weekly data is available)
+Boom / Bust / Steady / Balanced variance profiling.
 
-Output per player:
-  variance_score  float 0.0–1.0  (higher = more volatile)
-  variance_label  "Boom/Bust" | "Balanced" | "Steady"
-  variance_icon   "🔴" | "🟡" | "🟢"
-  td_pct          float — share of projected points from TDs
-  floor_pct       float — share from non-TD yards/receptions
-  environment     str   — dome | retractable | outdoor_warm | outdoor_cold
+Key design decisions:
+  - Position variance base encodes known game-script dependency by position
+  - TD dependency bonus heavily penalizes players relying on TDs for value
+  - Anti-floor bonus rewards players with minimal reliable production
+  - Environment modifier reflects dome vs outdoor/cold reality
+  - Historical std dev (when available) anchors to actual observed data
+
+Thresholds:
+  Steady    < 0.30   🟢  Reliable floor, low weekly variance
+  Balanced  0.30–0.48 🟡  Mix of floor and upside
+  Boom/Bust > 0.48   🔴  High ceiling, low floor, TD-dependent or weather-exposed
 """
 
 import pandas as pd
 import numpy as np
 from typing import Optional
 
-# ── Stadium environment ───────────────────────────────────────────────────────
-# Dome / retractable / outdoor warm / outdoor cold
-# Updated for 2026 rosters
-
+# ── Stadium environments ──────────────────────────────────────────────────────
 TEAM_ENVIRONMENT = {
     # Full domes
-    "NO":  "dome",
-    "DET": "dome",
-    "MIN": "dome",
-    "IND": "dome",
-    "HOU": "dome",   # NRG Stadium has retractable but almost always closed
-    "SEA": "dome",   # Lumen Field — covered but open-air counts as dome-like
-    # Retractable roofs (mostly closed for games)
-    "KC":  "retractable",
-    "LAR": "retractable",
-    "LAC": "retractable",
-    "LV":  "retractable",
-    "DAL": "retractable",
-    "ARI": "retractable",
-    "ATL": "retractable",
-    # Outdoor warm-weather (mild temps, low wind/rain variance)
-    "MIA": "outdoor_warm",
-    "TB":  "outdoor_warm",
-    "JAX": "outdoor_warm",
-    "LAX": "outdoor_warm",  # fallback
-    # Outdoor cold-weather (meaningful late-season variance)
-    "BUF": "outdoor_cold",
-    "GB":  "outdoor_cold",
-    "CHI": "outdoor_cold",
-    "NE":  "outdoor_cold",
-    "PIT": "outdoor_cold",
-    "CLE": "outdoor_cold",
-    "CIN": "outdoor_cold",
-    "NYG": "outdoor_cold",
-    "NYJ": "outdoor_cold",
-    "PHI": "outdoor_cold",
-    "WAS": "outdoor_cold",
-    "BAL": "outdoor_cold",
-    "DEN": "outdoor_cold",
-    # Default outdoor (moderate)
-    "SF":  "outdoor_warm",
-    "TEN": "outdoor_warm",
-    "CAR": "outdoor_warm",
+    "NO": "dome", "DET": "dome", "MIN": "dome",
+    "IND": "dome", "SEA": "dome",
+    # Retractable (almost always closed)
+    "KC": "retractable", "LAR": "retractable", "LAC": "retractable",
+    "LV": "retractable", "DAL": "retractable", "ARI": "retractable",
+    "ATL": "retractable", "HOU": "retractable",
+    # Outdoor warm
+    "MIA": "outdoor_warm", "TB": "outdoor_warm", "JAX": "outdoor_warm",
+    "SF":  "outdoor_warm", "TEN": "outdoor_warm", "CAR": "outdoor_warm",
     "NO2": "outdoor_warm",
+    # Outdoor cold (meaningful late-season variance)
+    "BUF": "outdoor_cold", "GB": "outdoor_cold", "CHI": "outdoor_cold",
+    "NE":  "outdoor_cold", "PIT": "outdoor_cold", "CLE": "outdoor_cold",
+    "CIN": "outdoor_cold", "NYG": "outdoor_cold", "NYJ": "outdoor_cold",
+    "PHI": "outdoor_cold", "WAS": "outdoor_cold", "BAL": "outdoor_cold",
+    "DEN": "outdoor_cold",
 }
 
 ENVIRONMENT_VARIANCE = {
-    "dome":          0.00,
-    "retractable":   0.05,
-    "outdoor_warm":  0.10,
-    "outdoor_cold":  0.22,
+    "dome":         0.00,
+    "retractable":  0.05,
+    "outdoor_warm": 0.10,
+    "outdoor_cold": 0.22,
 }
 
 ENVIRONMENT_LABELS = {
-    "dome":          "🏟️ Dome",
-    "retractable":   "🏟️ Retractable",
-    "outdoor_warm":  "☀️ Outdoor",
-    "outdoor_cold":  "❄️ Cold/Outdoor",
+    "dome":         "🏟️ Dome",
+    "retractable":  "🏟️ Retractable",
+    "outdoor_warm": "☀️ Outdoor",
+    "outdoor_cold": "❄️ Cold/Outdoor",
 }
+
+# ── Position variance bases ───────────────────────────────────────────────────
+# These encode the known inherent game-script dependency of each position.
+# WRs and TEs have higher base variance because even high-volume players
+# have feast-or-famine weekly outputs driven by targets and coverage.
+
+POSITION_VARIANCE_BASE = {
+    "QB":  0.20,   # Relatively predictable — volume stat producers
+    "RB":  0.30,   # Committee/injury risk raises variance
+    "WR":  0.40,   # Inherently game-script dependent
+    "TE":  0.45,   # TD-dependent, few reliable starters outside top 3
+    "K":   0.30,   # Moderate — driven by team scoring and opportunities
+    "DST": 0.38,   # Matchup-driven, high week-to-week swings
+}
+
+# Additional no-projection bonus — reflects that unknown roles have extra risk
+POSITION_NO_PROJ_BONUS = {
+    "QB":  0.05,
+    "RB":  0.10,
+    "WR":  0.15,
+    "TE":  0.20,
+    "K":   0.08,
+    "DST": 0.12,
+}
+
+BOOM_BUST_THRESHOLD = 0.48
+STEADY_THRESHOLD    = 0.30
 
 
 def get_environment(team: str) -> str:
@@ -96,82 +97,63 @@ def calculate_variance_score(
     scoring: dict,
     historical_std: Optional[float] = None,
 ) -> dict:
-    """
-    Returns a full variance profile for a single player.
+    """Returns full variance profile dict for a single player."""
 
-    Parameters
-    ----------
-    stats              : projected stat line dict
-    projected_points   : total projected fantasy points (pre-calculated)
-    position           : QB / RB / WR / TE / K / DST
-    team               : NFL team abbreviation
-    scoring            : league scoring settings dict
-    historical_std     : optional — observed weekly std dev from last season
-    """
+    env        = get_environment(team)
+    env_var    = ENVIRONMENT_VARIANCE.get(env, 0.10)
+    pos_base   = POSITION_VARIANCE_BASE.get(position, 0.35)
+    env_bonus  = env_var * 0.5
 
+    # ── No projections path ───────────────────────────────────────────────────
     if projected_points <= 0:
-        # No projections — use position-based defaults
-        defaults = {
-            "QB":  {"variance_score": 0.35, "label": "Balanced"},
-            "RB":  {"variance_score": 0.45, "label": "Balanced"},
-            "WR":  {"variance_score": 0.50, "label": "Balanced"},
-            "TE":  {"variance_score": 0.55, "label": "Boom/Bust"},
-            "K":   {"variance_score": 0.40, "label": "Balanced"},
-            "DST": {"variance_score": 0.45, "label": "Balanced"},
-        }
-        d = defaults.get(position, {"variance_score": 0.45, "label": "Balanced"})
-        env = get_environment(team)
-        env_var = ENVIRONMENT_VARIANCE.get(env, 0.10)
-        score = min(d["variance_score"] + env_var * 0.5, 1.0)
+        no_proj_bonus = POSITION_NO_PROJ_BONUS.get(position, 0.10)
+        if historical_std is not None:
+            # Historical std anchors the estimate even without projections
+            hist_norm  = min(historical_std / 18.0, 1.0)
+            score      = pos_base + hist_norm * 0.30 + env_bonus
+        else:
+            score = pos_base + no_proj_bonus + env_bonus
+        score = round(min(score, 1.0), 3)
         return _build_result(score, 0.0, 0.0, env, historical_std)
 
-    # ── TD points ────────────────────────────────────────────────────────────
-    td_points = 0.0
-    td_points += stats.get("passing_tds", 0)   * scoring.get("passing_td", 4.0)
-    td_points += stats.get("rushing_tds", 0)   * scoring.get("rushing_td", 6.0)
-    td_points += stats.get("receiving_tds", 0) * scoring.get("receiving_td", 6.0)
+    # ── Projection-based path ─────────────────────────────────────────────────
+    # TD points
+    td_pts  = 0.0
+    td_pts += stats.get("passing_tds",   0) * scoring.get("passing_td",  4.0)
+    td_pts += stats.get("rushing_tds",   0) * scoring.get("rushing_td",  6.0)
+    td_pts += stats.get("receiving_tds", 0) * scoring.get("receiving_td", 6.0)
+    td_pct  = min(td_pts / projected_points, 1.0)
 
-    td_pct = min(td_points / projected_points, 1.0) if projected_points > 0 else 0.0
+    # Volume floor points (reliable non-TD production)
+    floor_pts  = 0.0
+    floor_pts += stats.get("passing_yards",   0) / scoring.get("passing_yards_per_point",   25)
+    floor_pts += stats.get("rushing_yards",   0) / scoring.get("rushing_yards_per_point",   10)
+    floor_pts += stats.get("receiving_yards", 0) / scoring.get("receiving_yards_per_point", 10)
+    floor_pts += stats.get("receptions",      0) * scoring.get("reception", 0.0)
+    floor_pct  = min(floor_pts / projected_points, 1.0)
 
-    # ── Volume floor points (non-TD yards + receptions) ──────────────────────
-    floor_points = 0.0
-    floor_points += (stats.get("passing_yards", 0) / scoring.get("passing_yards_per_point", 25))
-    floor_points += (stats.get("rushing_yards", 0)  / scoring.get("rushing_yards_per_point", 10))
-    floor_points += (stats.get("receiving_yards", 0) / scoring.get("receiving_yards_per_point", 10))
-    floor_points += stats.get("receptions", 0) * scoring.get("reception", 0.0)
+    # TD dependency bonus — heavily penalizes players where TDs drive value
+    # Kicks in above 20% TD share, scales sharply above 40%
+    td_dependency_bonus = max(0.0, td_pct - 0.20) * 1.8
 
-    floor_pct = min(floor_points / projected_points, 1.0) if projected_points > 0 else 0.0
+    # Anti-floor bonus — rewards players whose points aren't backed by volume
+    anti_floor_bonus = max(0.0, 0.65 - floor_pct) * 0.50
 
-    # ── Environment variance ──────────────────────────────────────────────────
-    env = get_environment(team)
-    env_var = ENVIRONMENT_VARIANCE.get(env, 0.10)
+    score = pos_base + td_dependency_bonus + anti_floor_bonus + env_bonus
 
-    # ── Composite score ───────────────────────────────────────────────────────
-    # Weights: TD dependency 40%, volume floor (inverted) 30%, environment 15%,
-    # historical std 15% (if available)
-    td_component    = td_pct * 0.40
-    floor_component = (1.0 - floor_pct) * 0.30
-    env_component   = env_var * 0.15
-
+    # Historical std modifies the final score (±15% weight)
     if historical_std is not None:
-        # Normalize historical std to 0-1 range (std > 20 = max variance)
-        hist_norm       = min(historical_std / 20.0, 1.0)
-        hist_component  = hist_norm * 0.15
-        # Rescale other components to sum to 0.85
-        variance_score  = (td_component + floor_component + env_component) * (0.85 / 0.85) + hist_component
-    else:
-        # Without historical data, rescale to use full weight
-        variance_score = (td_component + floor_component + env_component) / 0.85
+        hist_norm = min(historical_std / 18.0, 1.0)
+        score = score * 0.85 + hist_norm * 0.30 * 0.15
 
-    variance_score = round(min(max(variance_score, 0.0), 1.0), 3)
-
-    return _build_result(variance_score, td_pct, floor_pct, env, historical_std)
+    score = round(min(max(score, 0.0), 1.0), 3)
+    return _build_result(score, td_pct, floor_pct, env, historical_std)
 
 
 def _build_result(score, td_pct, floor_pct, env, hist_std):
-    if score < 0.30:
+    if score < STEADY_THRESHOLD:
         label, icon = "Steady",    "🟢"
-    elif score < 0.55:
+    elif score < BOOM_BUST_THRESHOLD:
         label, icon = "Balanced",  "🟡"
     else:
         label, icon = "Boom/Bust", "🔴"
@@ -190,29 +172,19 @@ def _build_result(score, td_pct, floor_pct, env, hist_std):
 
 # ── Apply to full DataFrame ───────────────────────────────────────────────────
 
-def apply_variance_to_df(df: pd.DataFrame, scoring: dict,
-                          weekly_std_map: Optional[dict] = None) -> pd.DataFrame:
-    """
-    Adds variance columns to the full player DataFrame.
-
-    weekly_std_map: optional dict of {player_name: float} from historical data
-    """
+def apply_variance_to_df(
+    df: pd.DataFrame,
+    scoring: dict,
+    weekly_std_map: Optional[dict] = None,
+) -> pd.DataFrame:
     df = df.copy()
 
-    variance_scores  = []
-    variance_labels  = []
-    variance_icons   = []
-    td_pcts          = []
-    floor_pcts       = []
-    environments     = []
-    env_labels       = []
+    v_scores, v_labels, v_icons = [], [], []
+    td_pcts, floor_pcts, envs, env_lbls = [], [], [], []
 
     for _, row in df.iterrows():
-        hist_std = None
-        if weekly_std_map:
-            hist_std = weekly_std_map.get(row["name"])
-
-        result = calculate_variance_score(
+        hist_std = weekly_std_map.get(row["name"]) if weekly_std_map else None
+        result   = calculate_variance_score(
             stats            = row["stats"] if isinstance(row["stats"], dict) else {},
             projected_points = float(row.get("projected_points", 0)),
             position         = row["position"],
@@ -220,64 +192,54 @@ def apply_variance_to_df(df: pd.DataFrame, scoring: dict,
             scoring          = scoring,
             historical_std   = hist_std,
         )
-
-        variance_scores.append(result["variance_score"])
-        variance_labels.append(result["variance_label"])
-        variance_icons.append(result["variance_icon"])
+        v_scores.append(result["variance_score"])
+        v_labels.append(result["variance_label"])
+        v_icons.append(result["variance_icon"])
         td_pcts.append(result["td_pct"])
         floor_pcts.append(result["floor_pct"])
-        environments.append(result["environment"])
-        env_labels.append(result["env_label"])
+        envs.append(result["environment"])
+        env_lbls.append(result["env_label"])
 
-    df["variance_score"] = variance_scores
-    df["variance_label"] = variance_labels
-    df["variance_icon"]  = variance_icons
+    df["variance_score"] = v_scores
+    df["variance_label"] = v_labels
+    df["variance_icon"]  = v_icons
     df["td_pct"]         = td_pcts
     df["floor_pct"]      = floor_pcts
-    df["environment"]    = environments
-    df["env_label"]      = env_labels
-
+    df["environment"]    = envs
+    df["env_label"]      = env_lbls
     return df
 
 
 # ── Roster variance profile ───────────────────────────────────────────────────
 
-def get_roster_variance_profile(roster_picks: list, players_df: pd.DataFrame) -> dict:
-    """
-    Given a list of pick dicts from the draft state, returns a variance
-    profile for the user's current roster.
-
-    Returns:
-      counts       : {"Boom/Bust": N, "Balanced": N, "Steady": N}
-      avg_score    : float — average variance score across roster
-      recommendation : str — advice on what profile to target next
-    """
+def get_roster_variance_profile(
+    roster_picks: list,
+    players_df: pd.DataFrame,
+) -> dict:
     if not roster_picks or "variance_label" not in players_df.columns:
         return {"counts": {}, "avg_score": 0.5, "recommendation": ""}
 
     drafted_ids = {p["player_id"] for p in roster_picks}
     roster_df   = players_df[players_df["player_id"].isin(drafted_ids)]
 
-    counts = roster_df["variance_label"].value_counts().to_dict()
+    counts    = roster_df["variance_label"].value_counts().to_dict()
     avg_score = float(roster_df["variance_score"].mean()) if len(roster_df) > 0 else 0.5
 
     boom  = counts.get("Boom/Bust", 0)
-    bal   = counts.get("Balanced", 0)
-    stead = counts.get("Steady", 0)
-    total = boom + bal + stead
+    bal   = counts.get("Balanced",  0)
+    stead = counts.get("Steady",    0)
+    total = max(boom + bal + stead, 1)
 
-    if total == 0:
-        rec = "Draft a few players to see your variance profile."
-    elif boom / max(total, 1) > 0.6:
-        rec = "Your roster is high-variance. Consider adding a steady floor player next."
-    elif stead / max(total, 1) > 0.6:
-        rec = "Your roster is floor-heavy. You have room to swing for upside."
-    elif avg_score > 0.50:
-        rec = "Slight boom/bust lean — one more steady pick balances the roster."
-    elif avg_score < 0.35:
-        rec = "Very steady roster — you can afford a boom/bust upside play."
+    if boom / total > 0.60:
+        rec = "⚠️ High-variance roster — add a steady floor player next."
+    elif stead / total > 0.60:
+        rec = "🎯 Floor-heavy roster — room to swing for upside."
+    elif avg_score > 0.48:
+        rec = "🔴 Slight boom/bust lean — one steady pick balances things."
+    elif avg_score < 0.30:
+        rec = "🟢 Very steady roster — affordable to take a boom/bust swing."
     else:
-        rec = "Well-balanced variance profile. Draft best available."
+        rec = "✅ Well-balanced variance profile — draft best available."
 
     return {
         "counts":         counts,
@@ -289,37 +251,32 @@ def get_roster_variance_profile(roster_picks: list, players_df: pd.DataFrame) ->
 # ── Historical std dev from nflverse weekly data ──────────────────────────────
 
 def build_weekly_std_map(weekly_df: pd.DataFrame, scoring: dict) -> dict:
-    """
-    Given a DataFrame of weekly player stats (from nflverse),
-    calculates per-player standard deviation in weekly fantasy points.
-
-    Returns dict: {player_name: std_dev_float}
-    """
+    """Calculates per-player weekly fantasy point std dev from nflverse data."""
     from engine.scoring import calculate_projected_points
 
     if weekly_df.empty:
         return {}
 
     std_map = {}
-
     for name, group in weekly_df.groupby("player_name"):
         weekly_pts = []
         for _, row in group.iterrows():
             stats = {
-                "passing_yards":   row.get("passing_yards", 0) or 0,
-                "passing_tds":     row.get("passing_tds", 0) or 0,
-                "interceptions":   row.get("interceptions", 0) or 0,
-                "rushing_yards":   row.get("rushing_yards", 0) or 0,
-                "rushing_tds":     row.get("rushing_tds", 0) or 0,
-                "receptions":      row.get("receptions", 0) or 0,
-                "receiving_yards": row.get("receiving_yards", 0) or 0,
-                "receiving_tds":   row.get("receiving_tds", 0) or 0,
-                "fumbles_lost":    row.get("rushing_fumbles_lost", 0) or 0,
+                "passing_yards":   float(row.get("passing_yards",   0) or 0),
+                "passing_tds":     float(row.get("passing_tds",     0) or 0),
+                "interceptions":   float(row.get("interceptions",   0) or 0),
+                "rushing_yards":   float(row.get("rushing_yards",   0) or 0),
+                "rushing_tds":     float(row.get("rushing_tds",     0) or 0),
+                "rushing_attempts":float(row.get("carries",         0) or 0),
+                "receptions":      float(row.get("receptions",      0) or 0),
+                "receiving_yards": float(row.get("receiving_yards", 0) or 0),
+                "receiving_tds":   float(row.get("receiving_tds",   0) or 0),
+                "fumbles_lost":   (float(row.get("rushing_fumbles_lost",   0) or 0) +
+                                   float(row.get("receiving_fumbles_lost", 0) or 0)),
             }
             pts = calculate_projected_points(stats, scoring)
             weekly_pts.append(pts)
-
-        if len(weekly_pts) >= 4:  # need at least 4 games for meaningful std
+        if len(weekly_pts) >= 4:
             std_map[name] = round(float(np.std(weekly_pts)), 2)
 
     return std_map
