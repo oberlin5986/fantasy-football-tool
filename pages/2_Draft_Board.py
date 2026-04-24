@@ -6,6 +6,7 @@ import streamlit as st
 import pandas as pd
 from engine.draft_state import DraftState
 from engine.vorp import get_scarcity_scores, get_baseline_counts
+from engine.variance import get_roster_variance_profile
 
 st.set_page_config(page_title="Draft Board", page_icon="📋", layout="wide")
 st.title("📋 Draft Board")
@@ -125,8 +126,19 @@ with left_col:
     disp["VOR"]      = disp["vor"].round(1)
     disp["ADP"]      = disp["adp"].round(1)
     disp["Status"]   = disp["drafted"].apply(lambda d: "Drafted" if d else "Available")
-    disp = disp[["Name", "position", "team", "Proj Pts", "VOR", "ADP", "Status"]].reset_index(drop=True)
-    disp.columns = ["Name", "Pos", "Team", "Proj Pts", "VOR", "ADP", "Status"]
+
+    # Add variance column if available
+    has_variance = "variance_icon" in disp.columns
+    if has_variance:
+        disp["Type"] = disp["variance_icon"] + " " + disp["variance_label"]
+        show_cols = ["Name", "position", "team", "Proj Pts", "VOR", "ADP", "Type", "Status"]
+        col_names = ["Name", "Pos", "Team", "Proj Pts", "VOR", "ADP", "Type", "Status"]
+    else:
+        show_cols = ["Name", "position", "team", "Proj Pts", "VOR", "ADP", "Status"]
+        col_names = ["Name", "Pos", "Team", "Proj Pts", "VOR", "ADP", "Status"]
+
+    disp = disp[show_cols].reset_index(drop=True)
+    disp.columns = col_names
 
     selected = st.dataframe(
         disp, use_container_width=True, hide_index=True,
@@ -181,11 +193,21 @@ with right_col:
         for rec in recs:
             urgency = rec.get("urgency", "low")
             flag    = {"high": "🔴", "medium": "🟡", "low": ""}.get(urgency, "")
+            # Get variance info for this player
+            p_row = st.session_state.players_df[
+                st.session_state.players_df["name"] == rec["name"]
+            ]
+            var_icon  = p_row["variance_icon"].iloc[0]  if (len(p_row) > 0 and "variance_icon"  in p_row.columns) else ""
+            var_label = p_row["variance_label"].iloc[0] if (len(p_row) > 0 and "variance_label" in p_row.columns) else ""
+            env_label = p_row["env_label"].iloc[0]      if (len(p_row) > 0 and "env_label"      in p_row.columns) else ""
+
             with st.container(border=True):
                 c1, c2 = st.columns([3, 1])
                 c1.markdown(f"{flag} **{rec['name']}** — {rec['position']} ({rec['team']})")
                 c2.metric("VOR", f"{rec['vor']:.1f}")
                 c1.caption(f"Proj: {rec['projected_points']:.1f} pts · ADP: {rec['adp']:.1f}")
+                if var_label:
+                    c1.caption(f"{var_icon} {var_label}  {env_label}")
                 st.caption(f"_{rec['reasoning']}_")
 
     st.subheader("📊 Position Scarcity")
@@ -205,6 +227,34 @@ with right_col:
         st.dataframe(rdf, use_container_width=True, hide_index=True)
     else:
         st.caption("No picks yet.")
+
+    # ── Roster variance profile ───────────────────────────────────────────────
+    if my_picks and "variance_label" in st.session_state.players_df.columns:
+        st.subheader("📊 Roster Variance Profile")
+        profile = get_roster_variance_profile(my_picks, st.session_state.players_df)
+        counts  = profile.get("counts", {})
+
+        boom  = counts.get("Boom/Bust", 0)
+        bal   = counts.get("Balanced",  0)
+        stead = counts.get("Steady",    0)
+        total = boom + bal + stead
+
+        if total > 0:
+            pc1, pc2, pc3 = st.columns(3)
+            pc1.metric("🔴 Boom/Bust", boom)
+            pc2.metric("🟡 Balanced",  bal)
+            pc3.metric("🟢 Steady",    stead)
+
+            # Visual bar
+            avg = profile.get("avg_score", 0.5)
+            bar_pct = int(avg * 100)
+            st.markdown(
+                f"""<div style="background:#444;border-radius:6px;height:10px;margin:4px 0 8px 0;">
+                <div style="background:{'#e74c3c' if avg>0.55 else '#f39c12' if avg>0.30 else '#2ecc71'};
+                            width:{bar_pct}%;height:10px;border-radius:6px;"></div></div>""",
+                unsafe_allow_html=True,
+            )
+            st.caption(f"_{profile.get('recommendation', '')}_")
 
 # ── All Team Compositions ─────────────────────────────────────────────────────
 st.divider()
