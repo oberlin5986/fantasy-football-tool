@@ -49,14 +49,39 @@ if auto_advance and not sim.is_user_turn and not sim.draft_complete:
         st.toast(f"Team {pick['team']}: {pick['player_name']} ({pick['position']})")
     st.rerun()
 
-# ── Header ────────────────────────────────────────────────────────────────────
+# ── Turn indicator banner ─────────────────────────────────────────────────────
+if sim.draft_complete:
+    st.success("🎉 Simulation complete!")
+elif sim.is_user_turn:
+    st.markdown(
+        """
+        <div style="background-color:#1a6b3c;padding:14px 20px;border-radius:8px;
+                    margin-bottom:8px;border-left:6px solid #2ecc71;">
+            <span style="color:white;font-size:1.2rem;font-weight:700;">
+                🟢 YOUR PICK — You are on the clock!
+            </span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+else:
+    st.markdown(
+        f"""
+        <div style="background-color:#2c3e50;padding:14px 20px;border-radius:8px;
+                    margin-bottom:8px;border-left:6px solid #7f8c8d;">
+            <span style="color:#bdc3c7;font-size:1.1rem;font-weight:600;">
+                ⏳ CPU Drafting — Team {sim.current_team} is on the clock
+            </span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+# ── Header metrics ─────────────────────────────────────────────────────────────
 h1, h2, h3 = st.columns(3)
 h1.metric("Round",  sim.current_round)
 h2.metric("Pick #", sim.current_pick_number)
 h3.metric("Status", "🟢 YOUR PICK" if sim.is_user_turn else f"CPU – Team {sim.current_team}")
-
-if sim.draft_complete:
-    st.success("🎉 Simulation complete!")
 
 st.divider()
 
