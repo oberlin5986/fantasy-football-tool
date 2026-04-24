@@ -68,8 +68,9 @@ with col_b:
             scoring_type = {"Standard": "standard", "Half-PPR": "half_ppr"}.get(
                 cfg["scoring_preset"], "ppr"
             )
-            # Clear cache to force fresh fetch
-            load_players.clear()
+             # Clear the underlying cached functions to force fresh fetch
+            fetch_espn_projections.clear()
+            fetch_sleeper_adp.clear()
             players_df = load_players(scoring_type)
             players_df = apply_scoring_to_df(players_df, cfg["scoring"])
             players_df = calculate_vor(players_df, cfg)
