@@ -120,7 +120,16 @@ def fetch_espn_projections(season: int = ESPN_SEASON, scoring: str = "PPR") -> p
         espn_rank = rank_data.get("rank", 999)
 
         ownership = entry.get("ownership", {})
-        espn_adp  = ownership.get("averageDraftPosition") or espn_rank or 999
+        raw_adp   = ownership.get("averageDraftPosition") or 0
+
+        # ESPN defaults averageDraftPosition to 170.0 for unranked players in
+        # the offseason. Use espn_rank (from draftRanksByRankType) as the
+        # primary source — it properly differentiates players 1 through 2400+.
+        # Only use raw_adp if it looks like a real value (not the 170 floor).
+        if raw_adp and raw_adp != 170.0:
+            espn_adp = raw_adp
+        else:
+            espn_adp = float(espn_rank) if espn_rank < 999 else 999.0
 
         # ── Stat projections (available ~July onward) ─────────────────────────
         stats = {}
