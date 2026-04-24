@@ -95,8 +95,17 @@ def fetch_espn_projections(season: int = ESPN_SEASON, scoring: str = "PPR") -> p
         st.warning(f"ESPN projections unavailable ({e}). Using ADP-only rankings.")
         return pd.DataFrame()
 
+    # ESPN can return a dict with a "players" key, or occasionally a raw list
+    if isinstance(data, list):
+        player_list = data
+    elif isinstance(data, dict):
+        player_list = data.get("players", [])
+    else:
+        st.warning("ESPN returned an unexpected format. Using ADP-only rankings.")
+        return pd.DataFrame()
+
     records = []
-    for entry in data.get("players", []):
+    for entry in player_list:
         pool   = entry.get("playerPoolEntry", {})
         player = pool.get("player", {})
 
