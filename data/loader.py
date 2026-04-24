@@ -204,7 +204,8 @@ def merge_espn_onto_sleeper(sleeper_df: pd.DataFrame, espn_df: pd.DataFrame) -> 
         # Always update ADP with ESPN's value if it's more meaningful
         espn_adp = row.get("espn_adp", 999)
         if espn_adp < 999:
-            updated.loc[mask, "adp"] = espn_adp
+            updated["adp"] = updated["adp"].astype(float)
+            updated.loc[mask, "adp"] = float(espn_adp)
             rank_count += 1
 
         # Attach stat projections if available
