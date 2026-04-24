@@ -139,28 +139,35 @@ with st.expander("🔍 ESPN API Diagnostic — click here if projections aren't 
                 st.warning("ESPN returned no players. Raw response:")
                 st.json(data if isinstance(data, dict) else {})
             else:
-                for i, entry in enumerate(players[:2]):
-                    pool = entry.get("playerPoolEntry", {})
-                    plyr = pool.get("player", {})
-                    name = plyr.get("fullName", f"Player {i}")
-                    st.markdown(f"---\n**Player {i+1}: {name}**")
+                # Show raw keys of first entry so we can understand the structure
+                entry0 = players[0]
+                st.markdown("---\n**Raw structure of first entry:**")
+                st.write("**Top-level keys:**", list(entry0.keys()))
 
-                    # Show all stat blocks with their IDs and sample values
-                    stats_arr = plyr.get("stats", [])
-                    st.write(f"  `player.stats` blocks: {len(stats_arr)}")
-                    for sb in stats_arr:
-                        src   = sb.get("statSourceId", "?")
-                        split = sb.get("statSplitTypeId", "?")
-                        inner = sb.get("stats", sb.get("appliedStats", {}))
-                        sample = dict(list(inner.items())[:8]) if inner else "empty"
-                        st.write(f"  statSourceId=**{src}** · statSplitTypeId=**{split}** → `{sample}`")
+                # Try every plausible path to find name and stats
+                for path, getter in [
+                    ("entry.fullName",                          lambda e: e.get("fullName")),
+                    ("entry.player.fullName",                   lambda e: e.get("player", {}).get("fullName")),
+                    ("entry.playerPoolEntry.player.fullName",   lambda e: e.get("playerPoolEntry", {}).get("player", {}).get("fullName")),
+                    ("entry.onTeamId",                          lambda e: e.get("onTeamId")),
+                    ("entry.player keys",                       lambda e: list(e.get("player", {}).keys()) or "no 'player' key"),
+                    ("entry.playerPoolEntry keys",              lambda e: list(e.get("playerPoolEntry", {}).keys()) or "no 'playerPoolEntry' key"),
+                ]:
+                    try:
+                        val = getter(entry0)
+                        st.write(f"  `{path}` → `{val}`")
+                    except Exception as ex:
+                        st.write(f"  `{path}` → error: {ex}")
 
-                    # Also show pool-level keys in case total is stored there
-                    pool_keys = [k for k in pool.keys() if "stat" in k.lower() or "proj" in k.lower() or "total" in k.lower()]
-                    if pool_keys:
-                        st.write(f"  playerPoolEntry projection keys: `{pool_keys}`")
-                        for k in pool_keys:
-                            st.write(f"    `{k}`: {pool[k]}")
+                # Dump full first entry (truncated)
+                st.markdown("**Full first entry (raw JSON):**")
+                import json as _json
+                st.code(_json.dumps(entry0, indent=2)[:3000], language="json")
+
+                # Second entry for comparison
+                if len(players) > 1:
+                    st.markdown("**Full second entry (raw JSON):**")
+                    st.code(_json.dumps(players[1], indent=2)[:2000], language="json")
 
         except Exception as e:
             st.error(f"Request failed: {e}")
