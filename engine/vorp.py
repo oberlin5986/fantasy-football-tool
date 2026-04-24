@@ -90,11 +90,13 @@ def calculate_vor(df: pd.DataFrame, league_config: dict) -> pd.DataFrame:
 
 def get_scarcity_scores(available_df: pd.DataFrame, baseline_counts: dict) -> dict:
     """
-    Returns a scarcity score per position: ratio of viable remaining players
-    to total baseline starters. Below 1.0 means scarcity is setting in.
+    Returns a scarcity score per position. Starts high and decreases
+    naturally as good players are drafted.
 
-    Viable = VOR >= 0 if projections exist, otherwise top-ADP players
-    within 2x the baseline count (handles ADP-only mode).
+    With projections: counts players at or above replacement level (VOR >= 0).
+    ADP-only: counts players within a realistic draftable ADP window
+              (top 3x the starter baseline per position), so the ratio
+              starts around 100% and drops as those players are taken.
     """
     scarcity = {}
     has_projections = (available_df["projected_points"] > 0).any()
@@ -103,11 +105,13 @@ def get_scarcity_scores(available_df: pd.DataFrame, baseline_counts: dict) -> di
         pos_players = available_df[available_df["position"] == pos]
 
         if has_projections:
-            # Players at or above replacement level
             viable = pos_players[pos_players["vor"] >= 0]
         else:
-            # ADP-only: treat the top (count * 2) ADP players as "viable"
-            viable = pos_players.sort_values("adp").head(count * 2)
+            # Draftable window = top 3x the starter count by ADP
+            # e.g. 30 baseline RBs → only count RBs with ADP <= 90
+            # This excludes the 300+ filler players inflating the number
+            adp_cutoff = count * 3
+            viable = pos_players[pos_players["adp"] <= adp_cutoff]
 
         scarcity[pos] = round(len(viable) / max(count, 1), 2)
 
