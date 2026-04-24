@@ -17,7 +17,7 @@ import streamlit as st
 from thefuzz import process as fuzzy_process
 
 POSITIONS  = ["QB", "RB", "WR", "TE", "K", "DST"]
-ESPN_SEASON = 2026   # Update each year
+ESPN_SEASON = 2025   # Update each year
 
 # ── ESPN stat ID → our internal stat name ────────────────────────────────────
 # These IDs are from the undocumented ESPN Fantasy API (community-documented).
@@ -56,27 +56,34 @@ ESPN_POS_MAP = {1: "QB", 2: "RB", 3: "WR", 4: "TE", 5: "K", 16: "DST"}
 @st.cache_data(ttl=43200)  # Cache 12 hrs — projections update daily
 def fetch_espn_projections(season: int = ESPN_SEASON, scoring: str = "PPR") -> pd.DataFrame:
     """
-    Pulls current-season player projections from ESPN's undocumented Fantasy API.
-    Returns a DataFrame with name, position, team, stats (dict).
+    Pulls current-season player projections from ESPN's Fantasy API.
 
-    NOTE: This is an unofficial endpoint. ESPN may change it without notice.
-    The tool falls back to ADP-only rankings if this fails.
+    Uses the free-agent/waivers player pool endpoint which returns full
+    playerPoolEntry objects including projected stat lines. This is the
+    endpoint ESPN's own draft board uses internally.
     """
-    url = f"https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl/seasons/{season}/players"
+    # This endpoint returns playerPoolEntry objects with stats attached,
+    # unlike /players which only returns a flat roster info list.
+    url = f"https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl/seasons/{season}/segments/0/leagues/0"
 
-    # X-Fantasy-Filter tells ESPN which stats and how many players to return.
-    # statSourceId 1 = projections (0 = actuals)
-    # statSplitTypeId 0 = full season total
+    scoring_val = {"PPR": "PPR", "HALF_PPR": "HALF", "STANDARD": "STANDARD"}.get(
+        scoring.upper(), "PPR"
+    )
+
     xff = json.dumps({
         "players": {
             "limit": 1000,
+            "offset": 0,
+            "filterStatus": {"value": ["FREEAGENT", "WAIVERS", "ONROSTER"]},
             "filterStatsForSourceIds":    {"value": [1]},
             "filterStatsForSplitTypeIds": {"value": [0]},
             "sortDraftRanks": {
                 "sortPriority": 100,
                 "sortAsc": True,
-                "value": scoring.upper(),
+                "value": scoring_val,
             },
+            "filterRanksForScoringPeriodIds": {"value": [0]},
+            "filterRanksForRankTypes": {"value": [scoring_val]},
         }
     })
 
@@ -95,11 +102,11 @@ def fetch_espn_projections(season: int = ESPN_SEASON, scoring: str = "PPR") -> p
         st.warning(f"ESPN projections unavailable ({e}). Using ADP-only rankings.")
         return pd.DataFrame()
 
-    # ESPN can return a dict with a "players" key, or occasionally a raw list
-    if isinstance(data, list):
-        player_list = data
-    elif isinstance(data, dict):
+    # This endpoint returns a league-shaped dict with a "players" list
+    if isinstance(data, dict):
         player_list = data.get("players", [])
+    elif isinstance(data, list):
+        player_list = data
     else:
         st.warning("ESPN returned an unexpected format. Using ADP-only rankings.")
         return pd.DataFrame()
@@ -112,15 +119,13 @@ def fetch_espn_projections(season: int = ESPN_SEASON, scoring: str = "PPR") -> p
         name   = player.get("fullName", "").strip()
         pos_id = player.get("defaultPositionId", 0)
         pos    = ESPN_POS_MAP.get(pos_id)
-        team   = str(entry.get("onTeamId", ""))
 
         if not name or not pos:
             continue
 
-        # Extract projected stat line from stats array
+        # Extract projected stat line — statSourceId 1 = projections, splitTypeId 0 = full season
         stats = {}
         for stat_block in player.get("stats", []):
-            # statSourceId 1 = projections, statSplitTypeId 0 = full season
             if stat_block.get("statSourceId") == 1 and stat_block.get("statSplitTypeId") == 0:
                 raw = stat_block.get("stats", {})
                 for espn_id, our_name in ESPN_STAT_MAP.items():
@@ -131,17 +136,21 @@ def fetch_espn_projections(season: int = ESPN_SEASON, scoring: str = "PPR") -> p
         records.append({
             "espn_name": name,
             "position":  pos,
-            "espn_team": team,
+            "espn_team": str(entry.get("onTeamId", "")),
             "stats":     stats,
             "has_proj":  len(stats) > 0,
         })
 
-    df = pd.DataFrame(records)
-    matched = int(df["has_proj"].sum()) if not df.empty else 0
+    if not records:
+        st.warning("ESPN returned data but no players parsed. Using ADP-only rankings.")
+        return pd.DataFrame()
+
+    df      = pd.DataFrame(records)
+    matched = int(df["has_proj"].sum())
     if matched > 0:
         st.caption(f"📊 ESPN projections loaded: {matched} players with stat lines.")
     else:
-        st.warning("ESPN returned data but no stat projections found. May be off-season.")
+        st.warning("ESPN returned players but no stat projections found. May be pre-season.")
 
     return df
 
