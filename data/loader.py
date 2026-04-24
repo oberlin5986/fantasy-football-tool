@@ -23,7 +23,7 @@ POSITIONS = ["QB", "RB", "WR", "TE", "K", "DST"]
 # ── nflverse stats (free, GitHub releases) ────────────────────────────────────
 
 NFLVERSE_STATS_URL = (
-    "https://github.com/nflverse/nflverse-data/releases/latest/download/player_stats.csv"
+    "https://github.com/nflverse/nflverse-data/releases/download/player_stats/player_stats.csv"
 )
 
 @st.cache_data(ttl=86400)  # Cache 24 hrs — historical stats don't change
