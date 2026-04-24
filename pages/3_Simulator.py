@@ -27,8 +27,14 @@ show_cpu_picks = sc3.checkbox("Show CPU pick toasts", value=False)
 
 st.divider()
 
-# ── Init sim state ────────────────────────────────────────────────────────────
-if "sim_state" not in st.session_state or st.session_state.sim_state is None:
+# ── Init / safety-reset sim state ────────────────────────────────────────────
+try:
+    if "sim_state" not in st.session_state or st.session_state.sim_state is None:
+        raise ValueError("No sim state")
+    sim = st.session_state.sim_state
+    _ = sim.current_round
+    _ = sim.is_user_turn
+except Exception:
     st.session_state.sim_state = None
 
 if st.session_state.sim_state is None:
