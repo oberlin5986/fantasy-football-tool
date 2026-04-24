@@ -204,8 +204,7 @@ def merge_espn_onto_sleeper(sleeper_df: pd.DataFrame, espn_df: pd.DataFrame) -> 
         # Always update ADP with ESPN's value if it's more meaningful
         espn_adp = row.get("espn_adp", 999)
         if espn_adp < 999:
-            updated["adp"] = updated["adp"].astype(float)
-            updated.loc[mask, "adp"] = float(espn_adp)
+            updated.loc[mask, "adp"] = espn_adp
             rank_count += 1
 
         # Attach stat projections if available
@@ -244,8 +243,15 @@ def fetch_sleeper_adp() -> pd.DataFrame:
         if not pos:
             continue
 
+        # Skip clearly inactive players (retired, practice squad fillers)
+        # Keep if: active status OR has a team OR is a DST
+        status = p.get("status", "")
+        is_dst = pos == "DST"
+        if not is_dst and status in ("Inactive", "Suspended", "PUP"):
+            continue
+
         # DST entries use team abbreviation as their name
-        if pos == "DST":
+        if is_dst:
             name = p.get("full_name") or p.get("last_name") or pid
             team = p.get("abbr_name") or p.get("team") or pid
         else:
