@@ -53,18 +53,16 @@ ESPN_POS_MAP = {1: "QB", 2: "RB", 3: "WR", 4: "TE", 5: "K", 16: "DST"}
 
 # ── ESPN Fantasy API ──────────────────────────────────────────────────────────
 
-@st.cache_data(ttl=43200)  # Cache 12 hrs — projections update daily
+@st.cache_data(ttl=43200)
 def fetch_espn_projections(season: int = ESPN_SEASON, scoring: str = "PPR") -> pd.DataFrame:
     """
-    Pulls current-season player projections from ESPN's Fantasy API.
+    Pulls player data from ESPN's Fantasy API.
 
-    Uses the free-agent/waivers player pool endpoint which returns full
-    playerPoolEntry objects including projected stat lines. This is the
-    endpoint ESPN's own draft board uses internally.
+    The flat /players endpoint returns direct player objects (no playerPoolEntry
+    wrapper). Stat projections are only populated by ESPN from ~July onward.
+    Before that, we extract ADP and draft ranks which are always available.
     """
-    # This endpoint returns playerPoolEntry objects with stats attached,
-    # unlike /players which only returns a flat roster info list.
-    url = f"https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl/seasons/{season}/segments/0/leagues/0"
+    url = f"https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl/seasons/{season}/players"
 
     scoring_val = {"PPR": "PPR", "HALF_PPR": "HALF", "STANDARD": "STANDARD"}.get(
         scoring.upper(), "PPR"
@@ -72,18 +70,14 @@ def fetch_espn_projections(season: int = ESPN_SEASON, scoring: str = "PPR") -> p
 
     xff = json.dumps({
         "players": {
-            "limit": 1000,
-            "offset": 0,
-            "filterStatus": {"value": ["FREEAGENT", "WAIVERS", "ONROSTER"]},
-            "filterStatsForSourceIds":    {"value": [1]},
-            "filterStatsForSplitTypeIds": {"value": [0]},
+            "limit": 1500,
+            "filterStatsForSourceIds":    {"value": [0, 1]},
+            "filterStatsForSplitTypeIds": {"value": [0, 1]},
             "sortDraftRanks": {
                 "sortPriority": 100,
                 "sortAsc": True,
                 "value": scoring_val,
             },
-            "filterRanksForScoringPeriodIds": {"value": [0]},
-            "filterRanksForRankTypes": {"value": [scoring_val]},
         }
     })
 
@@ -99,88 +93,116 @@ def fetch_espn_projections(season: int = ESPN_SEASON, scoring: str = "PPR") -> p
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
-        st.warning(f"ESPN projections unavailable ({e}). Using ADP-only rankings.")
+        st.warning(f"ESPN unavailable ({e}). Using Sleeper ADP only.")
         return pd.DataFrame()
 
-    # This endpoint returns a league-shaped dict with a "players" list
-    if isinstance(data, dict):
-        player_list = data.get("players", [])
-    elif isinstance(data, list):
-        player_list = data
-    else:
-        st.warning("ESPN returned an unexpected format. Using ADP-only rankings.")
+    player_list = data if isinstance(data, list) else data.get("players", [])
+
+    if not player_list:
+        st.warning("ESPN returned no players.")
         return pd.DataFrame()
 
-    records = []
+    records      = []
+    stat_count   = 0
+
     for entry in player_list:
-        pool   = entry.get("playerPoolEntry", {})
-        player = pool.get("player", {})
-
-        name   = player.get("fullName", "").strip()
-        pos_id = player.get("defaultPositionId", 0)
+        # Flat structure — fields are directly on the entry
+        name   = entry.get("fullName", "").strip()
+        pos_id = entry.get("defaultPositionId", 0)
         pos    = ESPN_POS_MAP.get(pos_id)
 
         if not name or not pos:
             continue
 
-        # Extract projected stat line — statSourceId 1 = projections, splitTypeId 0 = full season
+        # ── Draft rank / ADP (always available) ──────────────────────────────
+        ranks     = entry.get("draftRanksByRankType", {})
+        rank_data = ranks.get(scoring_val, ranks.get("PPR", ranks.get("STANDARD", {})))
+        espn_rank = rank_data.get("rank", 999)
+
+        ownership = entry.get("ownership", {})
+        espn_adp  = ownership.get("averageDraftPosition") or espn_rank or 999
+
+        # ── Stat projections (available ~July onward) ─────────────────────────
         stats = {}
-        for stat_block in player.get("stats", []):
+        for stat_block in entry.get("stats", []):
             if stat_block.get("statSourceId") == 1 and stat_block.get("statSplitTypeId") == 0:
                 raw = stat_block.get("stats", {})
                 for espn_id, our_name in ESPN_STAT_MAP.items():
-                    val = raw.get(espn_id, raw.get(int(espn_id), None))
-                    if val is not None and float(val) != 0:
-                        stats[our_name] = float(val)
+                    val = raw.get(espn_id, raw.get(int(espn_id) if espn_id.isdigit() else espn_id, None))
+                    if val is not None:
+                        try:
+                            fval = float(val)
+                            if fval != 0:
+                                stats[our_name] = fval
+                        except (ValueError, TypeError):
+                            pass
+
+        if stats:
+            stat_count += 1
 
         records.append({
             "espn_name": name,
             "position":  pos,
-            "espn_team": str(entry.get("onTeamId", "")),
+            "espn_adp":  float(espn_adp),
+            "espn_rank": int(espn_rank),
             "stats":     stats,
             "has_proj":  len(stats) > 0,
         })
 
-    if not records:
-        st.warning("ESPN returned data but no players parsed. Using ADP-only rankings.")
-        return pd.DataFrame()
+    df = pd.DataFrame(records)
 
-    df      = pd.DataFrame(records)
-    matched = int(df["has_proj"].sum())
-    if matched > 0:
-        st.caption(f"📊 ESPN projections loaded: {matched} players with stat lines.")
+    if stat_count > 0:
+        st.caption(f"📊 ESPN: {stat_count} players with full stat projections.")
     else:
-        st.warning("ESPN returned players but no stat projections found. May be pre-season.")
+        st.info(
+            f"📅 ESPN {season} stat projections not published yet "
+            f"(typically available July). Using ESPN draft ranks + ADP for rankings."
+        )
 
     return df
 
 
 def merge_espn_onto_sleeper(sleeper_df: pd.DataFrame, espn_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Fuzzy-matches ESPN player names onto the Sleeper player list and
-    attaches stat dicts.
+    Fuzzy-matches ESPN player names onto the Sleeper player list and attaches:
+    - Stat projections (when available, ~July onward)
+    - ESPN draft rank / ADP (always available, overwrites Sleeper search_rank)
     """
     if espn_df.empty:
         return sleeper_df
 
-    updated      = sleeper_df.copy()
+    updated       = sleeper_df.copy()
     sleeper_names = sleeper_df["name"].tolist()
-    matched_count = 0
+    stat_count    = 0
+    rank_count    = 0
 
     for _, row in espn_df.iterrows():
-        if not row["stats"]:
-            continue
         result = fuzzy_process.extractOne(row["espn_name"], sleeper_names)
-        if result and result[1] >= 85:
-            match_name = result[0]
-            mask = updated["name"] == match_name
-            # Only update if position matches (avoids wrong-player matches)
-            if updated.loc[mask, "position"].eq(row["position"]).any():
-                updated.loc[mask, "stats"]             = [row["stats"]] * mask.sum()
-                updated.loc[mask, "projection_source"] = f"ESPN {ESPN_SEASON}"
-                matched_count += 1
+        if not result or result[1] < 85:
+            continue
 
-    st.caption(f"✅ Matched {matched_count} players with ESPN {ESPN_SEASON} projections.")
+        match_name = result[0]
+        mask = (updated["name"] == match_name) & (updated["position"] == row["position"])
+        if not mask.any():
+            continue
+
+        # Always update ADP with ESPN's value if it's more meaningful
+        espn_adp = row.get("espn_adp", 999)
+        if espn_adp < 999:
+            updated.loc[mask, "adp"] = espn_adp
+            rank_count += 1
+
+        # Attach stat projections if available
+        if row.get("stats"):
+            updated.loc[mask, "stats"]             = [row["stats"]] * mask.sum()
+            updated.loc[mask, "projection_source"] = f"ESPN {ESPN_SEASON}"
+            stat_count += 1
+
+    if stat_count > 0:
+        st.caption(f"✅ Matched {stat_count} players with ESPN {ESPN_SEASON} stat projections.")
+    elif rank_count > 0:
+        st.caption(f"✅ ESPN {ESPN_SEASON} draft ranks applied to {rank_count} players (stat projections available ~July).")
+
     return updated
 
 
