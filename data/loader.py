@@ -16,8 +16,14 @@ import io
 import streamlit as st
 from thefuzz import process as fuzzy_process
 
-POSITIONS  = ["QB", "RB", "WR", "TE", "K", "DST"]
-ESPN_SEASON = 2025   # Update each year
+POSITIONS   = ["QB", "RB", "WR", "TE", "K", "DST"]
+ESPN_SEASON = 2026   # Update each year
+
+# Sleeper uses "DEF" for defense teams — map to our internal "DST"
+SLEEPER_POS_MAP = {
+    "QB": "QB", "RB": "RB", "WR": "WR", "TE": "TE",
+    "K":  "K",  "DEF": "DST", "DST": "DST",
+}
 
 # ── ESPN stat ID → our internal stat name ────────────────────────────────────
 # These IDs are from the undocumented ESPN Fantasy API (community-documented).
@@ -231,16 +237,28 @@ def fetch_sleeper_adp() -> pd.DataFrame:
 
     records = []
     for pid, p in players.items():
-        positions = p.get("fantasy_positions") or []
-        pos = positions[0] if positions else None
-        if pos not in POSITIONS:
+        raw_positions = p.get("fantasy_positions") or []
+        raw_pos = raw_positions[0] if raw_positions else None
+        pos = SLEEPER_POS_MAP.get(raw_pos)
+        if not pos:
             continue
-        team = p.get("team")
-        if not team:
+
+        # DST entries use team abbreviation as their name
+        if pos == "DST":
+            name = p.get("full_name") or p.get("last_name") or pid
+            team = p.get("abbr_name") or p.get("team") or pid
+        else:
+            team = p.get("team")
+            if not team:
+                continue
+            name = f"{p.get('first_name', '')} {p.get('last_name', '')}".strip()
+
+        if not name:
             continue
+
         records.append({
             "player_id": pid,
-            "name":      f"{p.get('first_name', '')} {p.get('last_name', '')}".strip(),
+            "name":      name,
             "position":  pos,
             "team":      team,
             "adp":       p.get("search_rank") or 999,
