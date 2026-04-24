@@ -371,14 +371,38 @@ def parse_user_upload(uploaded_file, master_df: pd.DataFrame) -> pd.DataFrame:
     return updated_df
 
 
+NFLVERSE_WEEKLY_URL = (
+    "https://github.com/nflverse/nflverse-data/releases/download/player_stats/player_stats.csv"
+)
+
+@st.cache_data(ttl=86400)
+def fetch_nflverse_weekly(season: int = 2025) -> pd.DataFrame:
+    """
+    Downloads nflverse weekly player stats for historical std dev calculation.
+    Uses prior season (2025) as the baseline for variance profiles.
+    """
+    try:
+        resp = requests.get(NFLVERSE_WEEKLY_URL, timeout=30)
+        resp.raise_for_status()
+        df = pd.read_csv(io.StringIO(resp.text), low_memory=False)
+        df = df[(df["season"] == season) & (df["season_type"] == "REG")]
+        if df.empty:
+            latest = df["season"].max() if not df.empty else season
+            df = df[df["season"] == latest]
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
 # ── Master loader ─────────────────────────────────────────────────────────────
 
-def load_players(scoring_type: str = "ppr") -> pd.DataFrame:
+def load_players(scoring_type: str = "ppr", scoring: dict = None) -> pd.DataFrame:
     """
     Main entry point.
     1. Load Sleeper player pool + ADP
-    2. Pull ESPN projections and merge onto player list
-    3. Return fully initialized DataFrame
+    2. Pull ESPN projections and merge
+    3. Fetch nflverse weekly data for historical variance
+    4. Return fully initialized DataFrame (variance calculated in League Setup)
     """
     sleeper_df = fetch_sleeper_adp()
     if sleeper_df.empty:
@@ -389,7 +413,17 @@ def load_players(scoring_type: str = "ppr") -> pd.DataFrame:
     sleeper_df["vor"]               = 0.0
     sleeper_df["projection_source"] = "ADP only"
     sleeper_df["drafted"]           = False
-    sleeper_df["adp"]               = sleeper_df["adp"].astype(float)  # ensure float before ESPN merge
+    sleeper_df["adp"]               = sleeper_df["adp"].astype(float)
+    # Variance placeholders — populated by apply_variance_to_df after scoring
+    sleeper_df["variance_score"] = 0.45
+    sleeper_df["variance_label"] = "Balanced"
+    sleeper_df["variance_icon"]  = "🟡"
+    sleeper_df["td_pct"]         = 0.0
+    sleeper_df["floor_pct"]      = 0.0
+    sleeper_df["environment"]    = sleeper_df["team"].apply(
+        lambda t: __import__("engine.variance", fromlist=["get_environment"]).get_environment(t)
+    )
+    sleeper_df["env_label"]      = ""
 
     # Merge ESPN projections
     scoring_label = {"ppr": "PPR", "half_ppr": "HALF_PPR", "standard": "STANDARD"}.get(
