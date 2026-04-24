@@ -187,7 +187,6 @@ def merge_espn_onto_sleeper(sleeper_df: pd.DataFrame, espn_df: pd.DataFrame) -> 
         return sleeper_df
 
     updated       = sleeper_df.copy()
-    updated["adp"] = updated["adp"].astype(float)  # ensure float before ESPN merge
     sleeper_names = sleeper_df["name"].tolist()
     stat_count    = 0
     rank_count    = 0
@@ -205,7 +204,7 @@ def merge_espn_onto_sleeper(sleeper_df: pd.DataFrame, espn_df: pd.DataFrame) -> 
         # Always update ADP with ESPN's value if it's more meaningful
         espn_adp = row.get("espn_adp", 999)
         if espn_adp < 999:
-            updated.loc[mask, "adp"] = float(espn_adp)
+            updated.loc[mask, "adp"] = espn_adp
             rank_count += 1
 
         # Attach stat projections if available
@@ -390,6 +389,7 @@ def load_players(scoring_type: str = "ppr") -> pd.DataFrame:
     sleeper_df["vor"]               = 0.0
     sleeper_df["projection_source"] = "ADP only"
     sleeper_df["drafted"]           = False
+    sleeper_df["adp"]               = sleeper_df["adp"].astype(float)  # ensure float before ESPN merge
 
     # Merge ESPN projections
     scoring_label = {"ppr": "PPR", "half_ppr": "HALF_PPR", "standard": "STANDARD"}.get(
