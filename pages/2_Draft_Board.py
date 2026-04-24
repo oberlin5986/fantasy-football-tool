@@ -1,417 +1,255 @@
 """
-data/loader.py
---------------
-Data ingestion layers (in priority order):
-  1. ESPN Fantasy API  — free, no key, current-season projections (stat lines)
-  2. Sleeper API       — free, no key, player pool + ADP
-  3. User CSV upload   — any source, fuzzy name matching
-
-projected_points is NEVER stored here — always computed fresh by scoring engine.
+pages/2_Draft_Board.py
 """
 
-import json
-import requests
-import pandas as pd
-import io
 import streamlit as st
-from thefuzz import process as fuzzy_process
+import pandas as pd
+from engine.draft_state import DraftState
+from engine.vorp import get_scarcity_scores, get_baseline_counts
 
-POSITIONS   = ["QB", "RB", "WR", "TE", "K", "DST"]
-ESPN_SEASON = 2026   # Update each year
+st.set_page_config(page_title="Draft Board", page_icon="📋", layout="wide")
+st.title("📋 Draft Board")
 
-# Sleeper uses "DEF" for defense teams — map to our internal "DST"
-SLEEPER_POS_MAP = {
-    "QB": "QB", "RB": "RB", "WR": "WR", "TE": "TE",
-    "K":  "K",  "DEF": "DST", "DST": "DST",
-}
+# ── Guard ─────────────────────────────────────────────────────────────────────
+if not st.session_state.get("league_config") or st.session_state.get("players_df") is None:
+    st.warning("Complete **League Setup** before starting the draft.")
+    st.stop()
 
-# ── ESPN stat ID → our internal stat name ────────────────────────────────────
-# These IDs are from the undocumented ESPN Fantasy API (community-documented).
-# ESPN returns stats as a dict keyed by numeric string IDs.
-ESPN_STAT_MAP = {
-    "0":  "pass_attempts",
-    "1":  "completions",
-    "3":  "passing_yards",
-    "4":  "passing_tds",
-    "20": "interceptions",      # INTs thrown
-    "23": "rushing_attempts",
-    "24": "rushing_yards",
-    "25": "rushing_tds",
-    "41": "receptions",
-    "42": "receiving_yards",
-    "43": "receiving_tds",
-    "72": "fumbles_lost",
-    # Kicker
-    "74": "fg_0_39",
-    "77": "fg_40_49",
-    "80": "fg_50_plus",
-    "85": "pat_made",
-    # DST
-    "99":  "dst_sack",
-    "100": "dst_interception",
-    "101": "dst_fumble_recovery",
-    "102": "dst_td",
-    "103": "dst_safety",
-}
+cfg = st.session_state.league_config
 
-ESPN_POS_MAP = {1: "QB", 2: "RB", 3: "WR", 4: "TE", 5: "K", 16: "DST"}
-
-
-# ── ESPN Fantasy API ──────────────────────────────────────────────────────────
-
-@st.cache_data(ttl=43200)
-def fetch_espn_projections(season: int = ESPN_SEASON, scoring: str = "PPR") -> pd.DataFrame:
-    """
-    Pulls player data from ESPN's Fantasy API.
-
-    The flat /players endpoint returns direct player objects (no playerPoolEntry
-    wrapper). Stat projections are only populated by ESPN from ~July onward.
-    Before that, we extract ADP and draft ranks which are always available.
-    """
-    url = f"https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl/seasons/{season}/players"
-
-    scoring_val = {"PPR": "PPR", "HALF_PPR": "HALF", "STANDARD": "STANDARD"}.get(
-        scoring.upper(), "PPR"
-    )
-
-    xff = json.dumps({
-        "players": {
-            "limit": 1500,
-            "filterStatsForSourceIds":    {"value": [0, 1]},
-            "filterStatsForSplitTypeIds": {"value": [0, 1]},
-            "sortDraftRanks": {
-                "sortPriority": 100,
-                "sortAsc": True,
-                "value": scoring_val,
-            },
-        }
-    })
-
-    headers = {
-        "X-Fantasy-Filter": xff,
-        "User-Agent": "Mozilla/5.0 (compatible; fantasy-draft-tool)",
-        "Accept": "application/json",
-    }
-    params = {"scoringPeriodId": 0, "view": "kona_player_info"}
-
+# ── Initialize draft state ────────────────────────────────────────────────────
+def _init_draft_state():
     try:
-        resp = requests.get(url, headers=headers, params=params, timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        st.warning(f"ESPN unavailable ({e}). Using Sleeper ADP only.")
-        return pd.DataFrame()
-
-    player_list = data if isinstance(data, list) else data.get("players", [])
-
-    if not player_list:
-        st.warning("ESPN returned no players.")
-        return pd.DataFrame()
-
-    records      = []
-    stat_count   = 0
-
-    for entry in player_list:
-        # Flat structure — fields are directly on the entry
-        name   = entry.get("fullName", "").strip()
-        pos_id = entry.get("defaultPositionId", 0)
-        pos    = ESPN_POS_MAP.get(pos_id)
-
-        if not name or not pos:
-            continue
-
-        # ── Draft rank / ADP (always available) ──────────────────────────────
-        ranks     = entry.get("draftRanksByRankType", {})
-        rank_data = ranks.get(scoring_val, ranks.get("PPR", ranks.get("STANDARD", {})))
-        espn_rank = rank_data.get("rank", 999)
-
-        ownership = entry.get("ownership", {})
-        raw_adp   = ownership.get("averageDraftPosition") or 0
-
-        # ESPN defaults averageDraftPosition to 170.0 for unranked players in
-        # the offseason. Use espn_rank (from draftRanksByRankType) as the
-        # primary source — it properly differentiates players 1 through 2400+.
-        # Only use raw_adp if it looks like a real value (not the 170 floor).
-        if raw_adp and raw_adp != 170.0:
-            espn_adp = raw_adp
-        else:
-            espn_adp = float(espn_rank) if espn_rank < 999 else 999.0
-
-        # ── Stat projections (available ~July onward) ─────────────────────────
-        stats = {}
-        for stat_block in entry.get("stats", []):
-            if stat_block.get("statSourceId") == 1 and stat_block.get("statSplitTypeId") == 0:
-                raw = stat_block.get("stats", {})
-                for espn_id, our_name in ESPN_STAT_MAP.items():
-                    val = raw.get(espn_id, raw.get(int(espn_id) if espn_id.isdigit() else espn_id, None))
-                    if val is not None:
-                        try:
-                            fval = float(val)
-                            if fval != 0:
-                                stats[our_name] = fval
-                        except (ValueError, TypeError):
-                            pass
-
-        if stats:
-            stat_count += 1
-
-        records.append({
-            "espn_name": name,
-            "position":  pos,
-            "espn_adp":  float(espn_adp),
-            "espn_rank": int(espn_rank),
-            "stats":     stats,
-            "has_proj":  len(stats) > 0,
-        })
-
-    df = pd.DataFrame(records)
-
-    if stat_count > 0:
-        st.caption(f"📊 ESPN: {stat_count} players with full stat projections.")
-    else:
-        st.info(
-            f"📅 ESPN {season} stat projections not published yet "
-            f"(typically available July). Using ESPN draft ranks + ADP for rankings."
+        ds = st.session_state.get("draft_state")
+        if ds is None:
+            raise ValueError("none")
+        # Sanity check — if these throw, the object is stale
+        _ = ds.current_round
+        _ = ds.is_user_turn
+        _ = ds.available_players
+        return ds
+    except Exception:
+        pass
+    try:
+        new_ds = DraftState(
+            players_df=st.session_state.players_df,
+            league_config=cfg,
         )
-
-    return df
-
-
-def merge_espn_onto_sleeper(sleeper_df: pd.DataFrame, espn_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Fuzzy-matches ESPN player names onto the Sleeper player list and attaches:
-    - Stat projections (when available, ~July onward)
-    - ESPN draft rank / ADP (always available, overwrites Sleeper search_rank)
-    """
-    if espn_df.empty:
-        return sleeper_df
-
-    updated       = sleeper_df.copy()
-    sleeper_names = sleeper_df["name"].tolist()
-    stat_count    = 0
-    rank_count    = 0
-
-    for _, row in espn_df.iterrows():
-        result = fuzzy_process.extractOne(row["espn_name"], sleeper_names)
-        if not result or result[1] < 85:
-            continue
-
-        match_name = result[0]
-        mask = (updated["name"] == match_name) & (updated["position"] == row["position"])
-        if not mask.any():
-            continue
-
-        # Always update ADP with ESPN's value if it's more meaningful
-        espn_adp = row.get("espn_adp", 999)
-        if espn_adp < 999:
-            updated.loc[mask, "adp"] = espn_adp
-            rank_count += 1
-
-        # Attach stat projections if available
-        if row.get("stats"):
-            updated.loc[mask, "stats"]             = [row["stats"]] * mask.sum()
-            updated.loc[mask, "projection_source"] = f"ESPN {ESPN_SEASON}"
-            stat_count += 1
-
-    if stat_count > 0:
-        st.caption(f"✅ Matched {stat_count} players with ESPN {ESPN_SEASON} stat projections.")
-    elif rank_count > 0:
-        st.caption(f"✅ ESPN {ESPN_SEASON} draft ranks applied to {rank_count} players (stat projections available ~July).")
-
-    return updated
-
-
-# ── Sleeper ADP ───────────────────────────────────────────────────────────────
-
-@st.cache_data(ttl=3600)
-def fetch_sleeper_adp() -> pd.DataFrame:
-    """Pulls current player pool + ADP from Sleeper's free API."""
-    url = "https://api.sleeper.app/v1/players/nfl"
-    try:
-        resp = requests.get(url, timeout=15)
-        resp.raise_for_status()
-        players = resp.json()
+        st.session_state.draft_state   = new_ds
+        st.session_state.draft_started = True
+        return new_ds
     except Exception as e:
-        st.warning(f"Could not fetch Sleeper data: {e}.")
-        return pd.DataFrame()
+        st.error(f"Could not start draft: {e}")
+        st.info("Go to **League Setup** and click Save Settings, then return here.")
+        st.stop()
 
-    records = []
-    for pid, p in players.items():
-        raw_positions = p.get("fantasy_positions") or []
-        raw_pos = raw_positions[0] if raw_positions else None
-        pos = SLEEPER_POS_MAP.get(raw_pos)
-        if not pos:
-            continue
+ds = _init_draft_state()
 
-        # Skip clearly inactive players (retired, practice squad fillers)
-        # Keep if: active status OR has a team OR is a DST
-        status = p.get("status", "")
-        is_dst = pos == "DST"
-        if not is_dst and status in ("Inactive", "Suspended", "PUP"):
-            continue
-
-        # DST entries use team abbreviation as their name
-        if is_dst:
-            name = p.get("full_name") or p.get("last_name") or pid
-            team = p.get("abbr_name") or p.get("team") or pid
-        else:
-            team = p.get("team")
-            if not team:
-                continue
-            name = f"{p.get('first_name', '')} {p.get('last_name', '')}".strip()
-
-        if not name:
-            continue
-
-        records.append({
-            "player_id": pid,
-            "name":      name,
-            "position":  pos,
-            "team":      team,
-            "adp":       p.get("search_rank") or 999,
-        })
-
-    df = pd.DataFrame(records)
-    return df.sort_values("adp").reset_index(drop=True)
-
-
-# ── FantasyPros CSV upload handler ────────────────────────────────────────────
-
-# FantasyPros exports use different column names — map them to our internal names
-FANTASYPROS_COL_MAP = {
-    "player":     "player_name",
-    "fpts":       None,           # ignore — we calculate our own
-    "g":          None,
-    "pass_att":   "pass_attempts",
-    "pass_comp":  "completions",
-    "pass_yds":   "passing_yards",
-    "pass_tds":   "passing_tds",
-    "pass_ints":  "interceptions",
-    "rush_att":   "rushing_attempts",
-    "rush_yds":   "rushing_yards",
-    "rush_tds":   "rushing_tds",
-    "rec":        "receptions",
-    "rec_yds":    "receiving_yards",
-    "rec_tds":    "receiving_tds",
-    "fl":         "fumbles_lost",
-    # Kicker
-    "fg":         "fg_total",
-    "fga":        None,
-    "xpt":        "pat_made",
-}
-
-
-def parse_user_upload(uploaded_file, master_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Parse a user-uploaded CSV. Handles both:
-      - Our standard template format (player_name column)
-      - FantasyPros export format (Player column, different stat names)
-    """
-    try:
-        upload_df = pd.read_csv(uploaded_file)
-    except Exception as e:
-        st.error(f"Could not read file: {e}")
-        return master_df
-
-    # Normalize column names
-    upload_df.columns = [c.strip().lower().replace(" ", "_") for c in upload_df.columns]
-
-    # Detect and remap FantasyPros format
-    is_fantasypros = "player" in upload_df.columns and "player_name" not in upload_df.columns
-    if is_fantasypros:
-        rename = {k: v for k, v in FANTASYPROS_COL_MAP.items() if k in upload_df.columns and v}
-        drop   = [k for k, v in FANTASYPROS_COL_MAP.items() if k in upload_df.columns and v is None]
-        upload_df = upload_df.rename(columns=rename).drop(columns=drop, errors="ignore")
-        st.info("Detected FantasyPros format — column names remapped automatically.")
-
-    if "player_name" not in upload_df.columns:
-        st.error("Upload must have a 'player_name' (or 'Player' for FantasyPros exports) column.")
-        return master_df
-
-    # Remove team/position suffix that FantasyPros sometimes appends to names
-    # e.g. "Patrick Mahomes KC QB" → "Patrick Mahomes"
-    upload_df["player_name"] = upload_df["player_name"].str.replace(
-        r"\s+[A-Z]{2,3}\s+(?:QB|RB|WR|TE|K|DST)$", "", regex=True
-    ).str.strip()
-
-    master_names  = master_df["name"].tolist()
-    matched       = []
-    unmatched     = []
-
-    for idx, row in upload_df.iterrows():
-        result = fuzzy_process.extractOne(str(row["player_name"]), master_names)
-        if result and result[1] >= 85:
-            pid = master_df[master_df["name"] == result[0]]["player_id"].iloc[0]
-            matched.append((idx, pid))
-        else:
-            unmatched.append(row["player_name"])
-
-    if unmatched:
-        st.warning(f"Could not match {len(unmatched)} player(s): {', '.join(str(n) for n in unmatched[:10])}")
-
-    updated_df = master_df.copy()
-    skip_cols  = {"player_name", "player", "position", "team", "g", "fpts"}
-    stat_cols  = [c for c in upload_df.columns if c not in skip_cols]
-
-    for row_idx, pid in matched:
-        row   = upload_df.iloc[row_idx]
-        stats = {}
-        for col in stat_cols:
-            try:
-                val = float(row[col])
-                if not pd.isna(val):
-                    stats[col] = val
-            except (ValueError, TypeError):
-                pass
-        mask = updated_df["player_id"] == pid
-        updated_df.loc[mask, "stats"]             = [stats] * mask.sum()
-        updated_df.loc[mask, "projection_source"] = "user upload"
-
-    st.success(f"Matched {len(matched)} players from upload.")
-    return updated_df
-
-
-# ── Master loader ─────────────────────────────────────────────────────────────
-
-def load_players(scoring_type: str = "ppr") -> pd.DataFrame:
-    """
-    Main entry point.
-    1. Load Sleeper player pool + ADP
-    2. Pull ESPN projections and merge onto player list
-    3. Return fully initialized DataFrame
-    """
-    sleeper_df = fetch_sleeper_adp()
-    if sleeper_df.empty:
-        sleeper_df = _placeholder_players()
-
-    sleeper_df["stats"]             = [{}] * len(sleeper_df)
-    sleeper_df["projected_points"]  = 0.0
-    sleeper_df["vor"]               = 0.0
-    sleeper_df["projection_source"] = "ADP only"
-    sleeper_df["drafted"]           = False
-
-    # Merge ESPN projections
-    scoring_label = {"ppr": "PPR", "half_ppr": "HALF_PPR", "standard": "STANDARD"}.get(
-        scoring_type, "PPR"
+# ── Turn banner ───────────────────────────────────────────────────────────────
+if ds.draft_complete:
+    st.success("🎉 Draft Complete!")
+elif ds.is_user_turn:
+    st.markdown(
+        """<div style="background:#1a6b3c;padding:14px 20px;border-radius:8px;
+                       margin-bottom:8px;border-left:6px solid #2ecc71;">
+            <span style="color:white;font-size:1.2rem;font-weight:700;">
+                🟢 YOUR PICK — You are on the clock!
+            </span></div>""",
+        unsafe_allow_html=True,
     )
-    espn_df = fetch_espn_projections(season=ESPN_SEASON, scoring=scoring_label)
-    if not espn_df.empty:
-        sleeper_df = merge_espn_onto_sleeper(sleeper_df, espn_df)
+else:
+    st.markdown(
+        f"""<div style="background:#2c3e50;padding:14px 20px;border-radius:8px;
+                        margin-bottom:8px;border-left:6px solid #7f8c8d;">
+            <span style="color:#bdc3c7;font-size:1.1rem;font-weight:600;">
+                ⏳ Waiting — Team {ds.current_team} is on the clock
+            </span></div>""",
+        unsafe_allow_html=True,
+    )
 
-    return sleeper_df.reset_index(drop=True)
+# ── Header metrics ────────────────────────────────────────────────────────────
+h1, h2, h3, h4 = st.columns(4)
+h1.metric("Round",         ds.current_round)
+h2.metric("Pick #",        ds.current_pick_number)
+h3.metric("On the Clock",  "🟢 YOU" if ds.is_user_turn else f"Team {ds.current_team}")
+h4.metric("Your Position", f"#{cfg['draft_position']}")
 
+st.divider()
 
-def _placeholder_players() -> pd.DataFrame:
-    data = [
-        ("p001", "Patrick Mahomes",    "QB",  "KC",   2.1),
-        ("p002", "Josh Allen",          "QB",  "BUF",  4.3),
-        ("p003", "CeeDee Lamb",         "WR",  "DAL",  5.2),
-        ("p004", "Tyreek Hill",         "WR",  "MIA",  7.8),
-        ("p005", "Christian McCaffrey", "RB",  "SF",   1.1),
-        ("p006", "Breece Hall",         "RB",  "NYJ",  9.4),
-        ("p007", "Travis Kelce",        "TE",  "KC",  11.2),
-        ("p008", "Sam LaPorta",         "TE",  "DET", 28.3),
-        ("p009", "Justin Jefferson",    "WR",  "MIN",  3.4),
-        ("p010", "Derrick Henry",       "RB",  "BAL", 14.2),
-    ]
-    return pd.DataFrame(data, columns=["player_id", "name", "position", "team", "adp"])
+left_col, right_col = st.columns([3, 2])
+
+# ─── LEFT: Player board ───────────────────────────────────────────────────────
+with left_col:
+    st.subheader("Player Board")
+
+    fc1, fc2, fc3 = st.columns(3)
+    pos_filter   = fc1.selectbox("Position", ["All", "QB", "RB", "WR", "TE", "K", "DST"])
+    sort_by      = fc2.selectbox("Sort by", ["VOR", "Projected Pts", "ADP"])
+    search_name  = fc3.text_input("Search player", "")
+    show_drafted = st.checkbox("Show drafted players", value=False)
+
+    if show_drafted or search_name:
+        board = ds.all_players_with_status.copy()
+    else:
+        board = ds.available_players.copy()
+        board["drafted"] = False
+
+    if pos_filter != "All":
+        board = board[board["position"] == pos_filter]
+    if search_name:
+        board = board[board["name"].str.contains(search_name, case=False, na=False)]
+
+    # Sort — fall back to ADP when no projections exist
+    has_proj = (board["projected_points"] > 0).any() if len(board) > 0 else False
+    if sort_by == "ADP":
+        board = board.sort_values("adp", ascending=True)
+    elif not has_proj:
+        board = board.sort_values("adp", ascending=True)
+    elif sort_by == "VOR":
+        board = board.sort_values("vor", ascending=False)
+    else:
+        board = board.sort_values("projected_points", ascending=False)
+
+    # Ranked players first
+    if not search_name:
+        ranked   = board[board["adp"] < 999]
+        unranked = board[board["adp"] >= 999]
+        board    = pd.concat([ranked, unranked]).reset_index(drop=True)
+
+    def fmt_name(row):
+        return f"✓ {row['name']}" if row.get("drafted", False) else row["name"]
+
+    disp = board.head(300).copy()
+    disp["Name"]     = disp.apply(fmt_name, axis=1)
+    disp["Proj Pts"] = disp["projected_points"].round(1)
+    disp["VOR"]      = disp["vor"].round(1)
+    disp["ADP"]      = disp["adp"].round(1)
+    disp["Status"]   = disp["drafted"].apply(lambda d: "Drafted" if d else "Available")
+    disp = disp[["Name", "position", "team", "Proj Pts", "VOR", "ADP", "Status"]].reset_index(drop=True)
+    disp.columns = ["Name", "Pos", "Team", "Proj Pts", "VOR", "ADP", "Status"]
+
+    selected = st.dataframe(
+        disp, use_container_width=True, hide_index=True,
+        selection_mode="single-row", on_select="rerun", height=380,
+    )
+
+    sel_rows = selected.selection.rows if selected.selection else []
+    if sel_rows:
+        raw_sel = board.iloc[sel_rows[0]]
+        if raw_sel.get("drafted", False):
+            st.warning(f"**{raw_sel['name']}** has already been drafted.")
+            sel_player = None
+        else:
+            sel_player = raw_sel
+            st.info(f"Selected: **{sel_player['name']}** ({sel_player['position']} – {sel_player['team']})")
+    else:
+        sel_player = None
+
+    b1, b2, b3 = st.columns(3)
+    with b1:
+        if st.button("✅ My Pick", type="primary",
+                     disabled=(not ds.is_user_turn or sel_player is None or ds.draft_complete)):
+            ds.make_pick(sel_player["player_id"])
+            st.rerun()
+    with b2:
+        if st.button("👥 Mark as Drafted",
+                     disabled=(ds.is_user_turn or sel_player is None or ds.draft_complete)):
+            ds.make_pick(sel_player["player_id"])
+            st.rerun()
+    with b3:
+        if st.button("↩️ Undo Last Pick", disabled=not ds.can_undo):
+            undone = ds.undo()
+            if undone:
+                st.toast(f"Undid: {undone['player_name']}")
+            st.rerun()
+
+# ─── RIGHT: Recommendations + Scarcity + Roster ───────────────────────────────
+with right_col:
+    if ds.is_user_turn and not ds.draft_complete:
+        st.subheader("💡 Recommendations")
+        run_risk = ds.get_run_risk()
+
+        risk_cols = st.columns(4)
+        for i, pos in enumerate(["QB", "RB", "WR", "TE"]):
+            risk = run_risk.get(pos, {}).get("risk_level", "low")
+            icon = {"high": "🔴", "medium": "🟡", "low": "🟢"}[risk]
+            risk_cols[i].caption(f"{icon} **{pos}**")
+        st.caption("🔴 High · 🟡 Moderate · 🟢 Low demand ahead")
+        st.write("")
+
+        recs = ds.get_recommendations(top_n=5)
+        for rec in recs:
+            urgency = rec.get("urgency", "low")
+            flag    = {"high": "🔴", "medium": "🟡", "low": ""}.get(urgency, "")
+            with st.container(border=True):
+                c1, c2 = st.columns([3, 1])
+                c1.markdown(f"{flag} **{rec['name']}** — {rec['position']} ({rec['team']})")
+                c2.metric("VOR", f"{rec['vor']:.1f}")
+                c1.caption(f"Proj: {rec['projected_points']:.1f} pts · ADP: {rec['adp']:.1f}")
+                st.caption(f"_{rec['reasoning']}_")
+
+    st.subheader("📊 Position Scarcity")
+    baseline_counts = get_baseline_counts(cfg)
+    avail_df        = ds.available_players
+    scarcity        = get_scarcity_scores(avail_df, baseline_counts)
+    sc_cols = st.columns(3)
+    for i, (pos, score) in enumerate(scarcity.items()):
+        icon = "🔴" if score < 0.3 else "🟡" if score < 0.6 else "🟢"
+        sc_cols[i % 3].metric(f"{icon} {pos}", f"{score:.0%}")
+
+    st.subheader(f"My Roster (Team {cfg['draft_position']})")
+    my_picks = ds.rosters.get(cfg["draft_position"], [])
+    if my_picks:
+        rdf = pd.DataFrame(my_picks)[["round", "player_name", "position"]]
+        rdf.columns = ["Rd", "Player", "Pos"]
+        st.dataframe(rdf, use_container_width=True, hide_index=True)
+    else:
+        st.caption("No picks yet.")
+
+# ── All Team Compositions ─────────────────────────────────────────────────────
+st.divider()
+with st.expander("👥 All Team Compositions", expanded=False):
+    summaries = ds.get_all_team_summaries()
+    pos_list  = ["QB", "RB", "WR", "TE", "K", "DST"]
+
+    hcols = st.columns([1] + [1] * len(pos_list))
+    hcols[0].markdown("**Team**")
+    for i, p in enumerate(pos_list):
+        hcols[i + 1].markdown(f"**{p}**")
+
+    for tnum in range(1, cfg["num_teams"] + 1):
+        pc      = summaries[tnum]["pos_counts"]
+        is_user = tnum == cfg["draft_position"]
+        label   = f"Team {tnum}" + (" 👈 YOU" if is_user else "")
+        rcols   = st.columns([1] + [1] * len(pos_list))
+        rcols[0].markdown(f"**{label}**" if is_user else label)
+        for i, p in enumerate(pos_list):
+            cnt = pc.get(p, 0)
+            rcols[i + 1].markdown(f"**{cnt}**" if is_user else str(cnt))
+
+    st.write("")
+    tabs = st.tabs([f"{'★ ' if t == cfg['draft_position'] else ''}Team {t}"
+                    for t in range(1, cfg["num_teams"] + 1)])
+    for i, tnum in enumerate(range(1, cfg["num_teams"] + 1)):
+        with tabs[i]:
+            picks = summaries[tnum]["picks"]
+            if picks:
+                tdf = pd.DataFrame(picks)[["round", "player_name", "position"]]
+                tdf.columns = ["Rd", "Player", "Pos"]
+                st.dataframe(tdf, use_container_width=True, hide_index=True)
+            else:
+                st.caption("No picks yet.")
+
+with st.expander("📜 Full Pick Log", expanded=False):
+    if ds.drafted_players:
+        ldf = pd.DataFrame(ds.drafted_players)
+        ldf = ldf[["pick_number", "round", "team", "player_name", "position"]]
+        ldf.columns = ["Pick #", "Round", "Team", "Player", "Pos"]
+        st.dataframe(ldf, use_container_width=True, hide_index=True)
+    else:
+        st.caption("No picks yet.")
+
+st.divider()
+if st.button("🔄 Reset Draft", type="secondary"):
+    ds.reset()
+    st.rerun()
