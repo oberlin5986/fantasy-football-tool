@@ -41,7 +41,7 @@ def fetch_sleeper_adp(scoring_type: str = "ppr") -> pd.DataFrame:
     records = []
     for pid, p in players.items():
         positions = p.get("fantasy_positions") or []
-pos = positions[0] if positions else None
+        pos = positions[0] if positions else None
         if pos not in POSITIONS:
             continue
         records.append({
