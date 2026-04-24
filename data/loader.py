@@ -17,7 +17,7 @@ import streamlit as st
 from thefuzz import process as fuzzy_process
 
 POSITIONS  = ["QB", "RB", "WR", "TE", "K", "DST"]
-ESPN_SEASON = 2025   # Update each year
+ESPN_SEASON = 2026   # Update each year
 
 # ── ESPN stat ID → our internal stat name ────────────────────────────────────
 # These IDs are from the undocumented ESPN Fantasy API (community-documented).
