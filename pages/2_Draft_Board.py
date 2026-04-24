@@ -127,16 +127,24 @@ with left_col:
     disp["ADP"]      = disp["adp"].round(1)
     disp["Status"]   = disp["drafted"].apply(lambda d: "Drafted" if d else "Available")
 
-    # Add variance column if available
-    has_variance = "variance_icon" in disp.columns
+    has_variance  = "variance_icon"   in disp.columns
+    has_matchups  = "hot_start_icon"  in disp.columns
+    has_playoffs  = "playoff_icon"    in disp.columns
+
+    show_cols, col_names = ["Name", "position", "team", "Proj Pts", "VOR", "ADP"], \
+                           ["Name", "Pos", "Team", "Proj Pts", "VOR", "ADP"]
+
     if has_variance:
         disp["Type"] = disp["variance_icon"] + " " + disp["variance_label"]
-        show_cols = ["Name", "position", "team", "Proj Pts", "VOR", "ADP", "Type", "Status"]
-        col_names = ["Name", "Pos", "Team", "Proj Pts", "VOR", "ADP", "Type", "Status"]
-    else:
-        show_cols = ["Name", "position", "team", "Proj Pts", "VOR", "ADP", "Status"]
-        col_names = ["Name", "Pos", "Team", "Proj Pts", "VOR", "ADP", "Status"]
+        show_cols.append("Type");  col_names.append("Type")
+    if has_matchups:
+        disp["Hot Start"] = disp["hot_start_icon"] + " " + disp["hot_start_label"]
+        show_cols.append("Hot Start");  col_names.append("Wks 1-3")
+    if has_playoffs:
+        disp["Playoffs"] = disp["playoff_icon"] + " " + disp["playoff_label"]
+        show_cols.append("Playoffs");  col_names.append("Wks 15-17")
 
+    show_cols.append("Status");  col_names.append("Status")
     disp = disp[show_cols].reset_index(drop=True)
     disp.columns = col_names
 
@@ -193,21 +201,30 @@ with right_col:
         for rec in recs:
             urgency = rec.get("urgency", "low")
             flag    = {"high": "🔴", "medium": "🟡", "low": ""}.get(urgency, "")
-            # Get variance info for this player
-            p_row = st.session_state.players_df[
-                st.session_state.players_df["name"] == rec["name"]
-            ]
-            var_icon  = p_row["variance_icon"].iloc[0]  if (len(p_row) > 0 and "variance_icon"  in p_row.columns) else ""
-            var_label = p_row["variance_label"].iloc[0] if (len(p_row) > 0 and "variance_label" in p_row.columns) else ""
-            env_label = p_row["env_label"].iloc[0]      if (len(p_row) > 0 and "env_label"      in p_row.columns) else ""
 
             with st.container(border=True):
                 c1, c2 = st.columns([3, 1])
                 c1.markdown(f"{flag} **{rec['name']}** — {rec['position']} ({rec['team']})")
                 c2.metric("VOR", f"{rec['vor']:.1f}")
                 c1.caption(f"Proj: {rec['projected_points']:.1f} pts · ADP: {rec['adp']:.1f}")
-                if var_label:
-                    c1.caption(f"{var_icon} {var_label}  {env_label}")
+
+                # Variance + environment
+                p_row = st.session_state.players_df[
+                    st.session_state.players_df["name"] == rec["name"]
+                ]
+                if len(p_row) > 0:
+                    badges = []
+                    if "variance_icon" in p_row.columns:
+                        badges.append(f"{p_row['variance_icon'].iloc[0]} {p_row['variance_label'].iloc[0]}")
+                    if "env_label" in p_row.columns and p_row["env_label"].iloc[0]:
+                        badges.append(p_row["env_label"].iloc[0])
+                    if "hot_start_icon" in p_row.columns and p_row["hot_start_label"].iloc[0] != "Unknown":
+                        badges.append(f"Wks 1-3: {p_row['hot_start_icon'].iloc[0]} {p_row['hot_start_label'].iloc[0]}")
+                    if "playoff_icon" in p_row.columns and p_row["playoff_label"].iloc[0] != "Unknown":
+                        badges.append(f"Wks 15-17: {p_row['playoff_icon'].iloc[0]} {p_row['playoff_label'].iloc[0]}")
+                    if badges:
+                        c1.caption("  ·  ".join(badges))
+
                 st.caption(f"_{rec['reasoning']}_")
 
     st.subheader("📊 Position Scarcity")
