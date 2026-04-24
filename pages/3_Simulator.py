@@ -101,9 +101,18 @@ with left_col:
     available  = sim.available_players.copy()
     if pos_filter != "All":
         available = available[available["position"] == pos_filter]
-    available = available.sort_values("vor", ascending=False)
 
-    display = available[["name", "position", "team", "projected_points", "vor", "adp"]].head(80)
+    # Fall back to ADP sort when no projections exist
+    has_proj = (available["projected_points"] > 0).any()
+    available = available.sort_values("adp" if not has_proj else "vor",
+                                      ascending=not has_proj)
+
+    # Ranked players first, then unranked
+    ranked   = available[available["adp"] < 999]
+    unranked = available[available["adp"] >= 999]
+    available = pd.concat([ranked, unranked]).reset_index(drop=True)
+
+    display = available[["name", "position", "team", "projected_points", "vor", "adp"]].head(300)
     display.columns = ["Name", "Pos", "Team", "Proj Pts", "VOR", "ADP"]
 
     selected = st.dataframe(
