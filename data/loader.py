@@ -22,9 +22,7 @@ POSITIONS = ["QB", "RB", "WR", "TE", "K", "DST"]
 
 # ── nflverse stats (free, GitHub releases) ────────────────────────────────────
 
-NFLVERSE_STATS_URL = (
-    "https://github.com/nflverse/nflverse-data/releases/download/player_stats/player_stats.csv"
-)
+NFLVERSE_STATS_URL = ("https://github.com/nflverse/nflverse-data/releases/download/player_stats/player_stats.csv")
 
 @st.cache_data(ttl=86400)  # Cache 24 hrs — historical stats don't change
 def fetch_nflverse_stats(season: int = 2024) -> pd.DataFrame:
